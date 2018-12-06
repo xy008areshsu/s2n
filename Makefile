@@ -67,9 +67,6 @@ bin: libs
 integration: bin
 	$(MAKE) -C tests integration
 
-.PHONY : valgrind
-valgrind: bin
-	$(MAKE) -C tests valgrind
 
 .PHONY : fuzz
 ifeq ($(shell uname),Linux)

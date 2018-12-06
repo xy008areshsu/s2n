@@ -21,18 +21,11 @@ else
 endif
 
 .PHONY : all
-all: libs
-	${MAKE} -C unit
-	@echo "\033[1m ${COMPILE_INFO} \033[0;39m"
-
-.PHONY : valgrind
-valgrind: libs
-	${MAKE} -C unit valgrind
-
-.PHONY : libs
-libs:
+all:
 	${MAKE} -C testlib
 	${MAKE} -C LD_PRELOAD
+	${MAKE} -C unit
+	@echo "\033[1m ${COMPILE_INFO} \033[0;39m"
 
 .PHONY : integration
 integration:

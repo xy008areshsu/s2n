@@ -41,7 +41,7 @@ def cleanup_processes(*processes):
         p.wait()
 
 
-def try_handshake(endpoint, port, cipher, ssl_version, server_cert=None, server_key=None, sig_algs=None, curves=None, dh_params=None, resume=False, no_ticket=False):
+def try_handshake(endpoint, port, cipher, ssl_version, server_cert=None, server_key=None, sig_algs=None, curves=None, dh_params=None, resume=False):
     """
     Attempt to handshake against Openssl s_server listening on `endpoint` and `port` using s2nc
 
@@ -55,7 +55,6 @@ def try_handshake(endpoint, port, cipher, ssl_version, server_cert=None, server_
     :param str curves: Elliptic curves for Openssl s_server to accept
     :param str dh_params: path to DH params for Openssl s_server to use
     :param bool resume: if s2n client has to use reconnect option
-    :param bool no_ticket: if s2n client has to not use session ticket
     :return: 0 on successfully negotiation(s), -1 on failure
     """
 
@@ -110,8 +109,6 @@ def try_handshake(endpoint, port, cipher, ssl_version, server_cert=None, server_
     s2nc_cmd = ["../../bin/s2nc", "-c", "test_all", "-i"]
     if resume:
         s2nc_cmd.append("-r")
-    if no_ticket:
-        s2nc_cmd.append("-T")
     s2nc_cmd.extend([str(endpoint), str(port)])
 
     envVars = os.environ.copy()
@@ -221,18 +218,14 @@ def handshake_test(host, port, test_ciphers):
 
     return failed
 
-def handshake_resumption_test(host, port, no_ticket=False):
+def handshake_resumption_test(host, port):
     """
     Basic handshake tests for session resumption.
     """
-    if no_ticket:
-        print("\n\tRunning s2n Client session resumption using session id tests:")
-    else:
-        print("\n\tRunning s2n Client session resumption using session ticket tests:")
-
+    print("\n\tRunning s2n Client session resumption tests:")
     failed = 0
     for ssl_version in [S2N_TLS10, S2N_TLS11, S2N_TLS12]:
-        ret = try_handshake(host, port, None, ssl_version, resume=True, no_ticket=no_ticket)
+        ret = try_handshake(host, port, None, ssl_version, resume=True)
         prefix = "Session Resumption for: %-40s ... " % (S2N_PROTO_VERS_TO_STR[ssl_version])
         print_result(prefix, ret)
         if ret != 0:
@@ -337,7 +330,6 @@ def main():
 
     failed = 0
     failed += handshake_test(host, port, test_ciphers)
-    failed += handshake_resumption_test(host, port, no_ticket=True)
     failed += handshake_resumption_test(host, port)
     failed += sigalg_test(host, port)
     failed += elliptic_curve_test(host, port)

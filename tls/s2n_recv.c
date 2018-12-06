@@ -53,7 +53,7 @@ int s2n_read_full_record(struct s2n_connection *conn, uint8_t * record_type, int
     /* Read the record until we at least have a header */
     while (s2n_stuffer_data_available(&conn->header_in) < S2N_TLS_RECORD_HEADER_LENGTH) {
         int remaining = S2N_TLS_RECORD_HEADER_LENGTH - s2n_stuffer_data_available(&conn->header_in);
-
+    
         if (s2n_connection_is_managed_corked(conn)) {
             GUARD(s2n_socket_set_read_size(conn, remaining));
         }
@@ -70,6 +70,7 @@ int s2n_read_full_record(struct s2n_connection *conn, uint8_t * record_type, int
         }
         conn->wire_bytes_in += r;
     }
+
     uint16_t fragment_length;
 
     /* If the first bit is set then this is an SSLv2 record */
@@ -130,6 +131,7 @@ ssize_t s2n_recv(struct s2n_connection * conn, void *buf, ssize_t size, s2n_bloc
     struct s2n_blob out = {.data = (uint8_t *) buf };
 
     if (conn->closed) {
+        GUARD(s2n_connection_wipe(conn));
         return 0;
     }
 
@@ -138,11 +140,13 @@ ssize_t s2n_recv(struct s2n_connection * conn, void *buf, ssize_t size, s2n_bloc
     while (size && !conn->closed) {
         int isSSLv2 = 0;
         uint8_t record_type;
+
         int r = s2n_read_full_record(conn, &record_type, &isSSLv2);
         if (r < 0) {
             if (s2n_errno == S2N_ERR_CLOSED) {
                 *blocked = S2N_NOT_BLOCKED;
                 if (!bytes_read) {
+                    GUARD(s2n_connection_wipe(conn));
                     return 0;
                 } else {
                     return bytes_read;
@@ -157,7 +161,7 @@ ssize_t s2n_recv(struct s2n_connection * conn, void *buf, ssize_t size, s2n_bloc
 
             /* If we get here, it's an error condition */
             if (s2n_errno != S2N_ERR_BLOCKED && s2n_allowed_to_cache_connection(conn) && conn->session_id_len) {
-                conn->config->cache_delete(conn->config->cache_delete_data, conn->session_id, conn->session_id_len);
+                conn->config->cache_delete(conn, conn->config->cache_delete_data, conn->session_id, conn->session_id_len);
             }
 
             return -1;

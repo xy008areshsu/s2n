@@ -13,7 +13,6 @@
  * permissions and limitations under the License.
  */
 
-#pragma once
 
 #include "crypto/s2n_certificate.h"
 #include "stuffer/s2n_stuffer.h"

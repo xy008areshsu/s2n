@@ -66,7 +66,7 @@ static struct s2n_handshake_action state_machine[] = {
     /* message_type_t           = {Record type   Message type     Writer S2N_SERVER                S2N_CLIENT }  */
     [CLIENT_HELLO]              = {TLS_HANDSHAKE, TLS_CLIENT_HELLO, 'C', {s2n_client_hello_recv, s2n_client_hello_send}}, 
     [SERVER_HELLO]              = {TLS_HANDSHAKE, TLS_SERVER_HELLO, 'S', {s2n_server_hello_send, s2n_server_hello_recv}}, 
-    [SERVER_NEW_SESSION_TICKET] = {TLS_HANDSHAKE, TLS_SERVER_NEW_SESSION_TICKET,'S', {s2n_server_nst_send, s2n_server_nst_recv}},
+    [SERVER_NEW_SESSION_TICKET] = {TLS_HANDSHAKE, TLS_SERVER_NEW_SESSION_TICKET,'S', {NULL, NULL}},     
     [SERVER_CERT]               = {TLS_HANDSHAKE, TLS_SERVER_CERT, 'S', {s2n_server_cert_send, s2n_server_cert_recv}},
     [SERVER_CERT_STATUS]        = {TLS_HANDSHAKE, TLS_SERVER_CERT_STATUS, 'S', {s2n_server_status_send, s2n_server_status_recv}},
     [SERVER_KEY]                = {TLS_HANDSHAKE, TLS_SERVER_KEY, 'S', {s2n_server_key_send, s2n_server_key_recv}},
@@ -226,7 +226,7 @@ static message_type_t handshakes[128][16] = {
              SERVER_CHANGE_CIPHER_SPEC, SERVER_FINISHED,
              APPLICATION_DATA
      },
-
+     
      [NEGOTIATED | FULL_HANDSHAKE | PERFECT_FORWARD_SECRECY | OCSP_STATUS | CLIENT_AUTH | NO_CLIENT_CERT ] = {
              CLIENT_HELLO,
              SERVER_HELLO, SERVER_CERT, SERVER_CERT_STATUS, SERVER_KEY, SERVER_CERT_REQ, SERVER_HELLO_DONE,
@@ -307,33 +307,16 @@ int s2n_conn_set_handshake_type(struct s2n_connection *conn)
     /* A handshake type has been negotiated */
     conn->handshake.handshake_type = NEGOTIATED;
 
-    if (conn->config->use_tickets) {
-        if (conn->session_ticket_status == S2N_DECRYPT_TICKET) {
-            if (!s2n_decrypt_session_ticket(conn)) {
-                return 0;
-            }
-
-            if (s2n_config_is_encrypt_decrypt_key_available(conn->config) == 1) {
-                conn->session_ticket_status = S2N_NEW_TICKET;
-                conn->handshake.handshake_type |= WITH_SESSION_TICKET;
-            }
-
-            /* If a session ticket is presented by the client, then skip lookup in Session ID server cache */
-            goto skip_cache_lookup;
-        }
-
-        if (conn->session_ticket_status == S2N_NEW_TICKET) {
-            conn->handshake.handshake_type |= WITH_SESSION_TICKET;
-        }
-    }
-
     /* If a TLS session is resumed, the Server should respond in its ServerHello with the same SessionId the
      * Client sent in the ClientHello. */
-    if (s2n_allowed_to_cache_connection(conn) && !s2n_resume_from_cache(conn)) {
+    if (s2n_allowed_to_cache_connection(conn) && s2n_resume_from_cache(conn) == 1) {
+        return 1;
+    }
+
+    if (s2n_allowed_to_cache_connection(conn) && s2n_resume_from_cache(conn) == 0) {
         return 0;
     }
 
-skip_cache_lookup:
     if (conn->mode == S2N_CLIENT && conn->client_session_resumed == 1) {
         return 0;
     }
@@ -394,12 +377,8 @@ static int s2n_conn_update_handshake_hashes(struct s2n_connection *conn, struct 
     const uint8_t md5_sha1_required = (s2n_handshake_is_hash_required(&conn->handshake, S2N_HASH_MD5) &&
                                        s2n_handshake_is_hash_required(&conn->handshake, S2N_HASH_SHA1));
 
-    if (md5_sha1_required) {
-        /* The MD5_SHA1 hash can still be used for TLS 1.0 and 1.1 in FIPS mode for 
-         * the handshake hashes. This will only be used for the signature check in the
-         * CertificateVerify message and the PRF. NIST SP 800-52r1 approves use
-         * of MD5_SHA1 for these use cases (see footnotes 15 and 20, and section
-         * 3.3.2) */
+    if (md5_sha1_required && s2n_hash_is_available(S2N_HASH_MD5_SHA1)) {
+        /* The MD5_SHA1 hash cannot be initialized when FIPS mode is set. */
         GUARD(s2n_hash_update(&conn->handshake.md5_sha1, data->data, data->size));
     }
 
@@ -581,6 +560,48 @@ static int handshake_read_io(struct s2n_connection *conn)
     uint8_t record_type;
     int isSSLv2;
 
+    if (conn->block_on_other_events) {
+        /* We first run the current state handler again to see if we can move
+         * forward. Since each state might have different situations, we check
+         * each state one by one
+         */
+        int r;
+
+        if (ACTIVE_STATE(conn).message_type == TLS_CLIENT_HELLO && ACTIVE_STATE(conn).writer == 'C' && conn->mode == S2N_SERVER) {
+            /* If it is in Client_Hello state and it is from server side and the
+             * writer is client, the handler is client_hello_recv()
+             */
+            r = ACTIVE_STATE(conn).handler[conn->mode] (conn);
+
+            if (r == 1) {
+
+                GUARD(s2n_stuffer_wipe(&conn->header_in));
+                GUARD(s2n_stuffer_wipe(&conn->in));
+                conn->in_status = ENCRYPTED;
+                return r;
+            }
+
+            if (r == 0) {
+                /* if r == 0, then we advance the state machine */
+                GUARD(s2n_handshake_conn_update_hashes(conn));
+                GUARD(s2n_stuffer_wipe(&conn->handshake.io));
+
+                conn->block_on_other_events = 0;
+                GUARD(s2n_advance_message(conn));
+                goto done;
+            }
+
+            if (r < 0) {
+
+                GUARD(s2n_handshake_conn_update_hashes(conn));
+                GUARD(s2n_stuffer_wipe(&conn->handshake.io));
+                GUARD(s2n_connection_kill(conn));
+
+                return r;
+            }
+        }
+    }
+
     GUARD(s2n_read_full_record(conn, &record_type, &isSSLv2));
 
     if (isSSLv2) {
@@ -591,6 +612,7 @@ static int handshake_read_io(struct s2n_connection *conn)
      * contain several messages.
      */
     S2N_ERROR_IF(record_type == TLS_APPLICATION_DATA, S2N_ERR_BAD_MESSAGE);
+
     if(record_type == TLS_CHANGE_CIPHER_SPEC) {
         S2N_ERROR_IF(s2n_stuffer_data_available(&conn->in) != 1, S2N_ERR_BAD_MESSAGE);
 
@@ -655,6 +677,13 @@ static int handshake_read_io(struct s2n_connection *conn)
         /* Call the relevant handler */
         r = ACTIVE_STATE(conn).handler[conn->mode] (conn);
 
+        if (r == 1) {
+            GUARD(s2n_stuffer_wipe(&conn->header_in));
+            GUARD(s2n_stuffer_wipe(&conn->in));
+            conn->in_status = ENCRYPTED;
+            return r;
+        }
+
         /* Don't update handshake hashes until after the handler has executed since some handlers need to read the
          * hash values before they are updated. */
         GUARD(s2n_handshake_conn_update_hashes(conn));
@@ -671,6 +700,8 @@ static int handshake_read_io(struct s2n_connection *conn)
         GUARD(s2n_advance_message(conn));
     }
 
+done:
+
     /* We're done with the record, wipe it */
     GUARD(s2n_stuffer_wipe(&conn->header_in));
     GUARD(s2n_stuffer_wipe(&conn->in));
@@ -681,6 +712,8 @@ static int handshake_read_io(struct s2n_connection *conn)
 
 int s2n_negotiate(struct s2n_connection *conn, s2n_blocked_status * blocked)
 {
+    int r;
+
     char this = 'S';
     if (conn->mode == S2N_CLIENT) {
         this = 'C';
@@ -695,26 +728,31 @@ int s2n_negotiate(struct s2n_connection *conn, s2n_blocked_status * blocked)
             if (handshake_write_io(conn) < 0 && s2n_errno != S2N_ERR_BLOCKED) {
                 /* Non-retryable write error. The peer might have sent an alert. Try and read it. */
                 const int write_s2n_errno = s2n_errno;
-                const char *write_s2n_debug_str = s2n_debug_str;
 
                 if (handshake_read_io(conn) < 0 && s2n_errno == S2N_ERR_ALERT) {
                     /* handshake_read_io has set s2n_errno */
                     return -1;
                 } else {
                     /* Let the write error take precedence if we didn't read an alert. */
-                    s2n_errno = write_s2n_errno;
-                    s2n_debug_str = write_s2n_debug_str;
-                    return -1;
+                    S2N_ERROR(write_s2n_errno);
                 }
             }
         } else {
             *blocked = S2N_BLOCKED_ON_READ;
-            if (handshake_read_io(conn) < 0) {
+            r = handshake_read_io(conn); 
+
+            if (r < 0) {
+
                 if (s2n_errno != S2N_ERR_BLOCKED && s2n_allowed_to_cache_connection(conn) && conn->session_id_len) {
-                    conn->config->cache_delete(conn->config->cache_delete_data, conn->session_id, conn->session_id_len);
+                    conn->config->cache_delete(conn, conn->config->cache_delete_data, conn->session_id, conn->session_id_len);
                 }
 
                 return -1;
+            }
+
+            if (r == 1) {
+                *blocked = S2N_BLOCKED_ON_OTHER_EVENTS;
+                S2N_ERROR(S2N_ERR_BLOCKED);
             }
         }
 

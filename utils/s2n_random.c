@@ -82,9 +82,6 @@ static inline int s2n_defend_if_forked(void)
     struct s2n_blob private = {.data = s2n_private_drbg,.size = sizeof(s2n_private_drbg) };
 
     if (zero_if_forked == 0) {
-        /* Clean up the old drbg first */
-        GUARD(s2n_rand_cleanup_thread());
-        /* Instantiate the new ones */
         GUARD(s2n_drbg_instantiate(&per_thread_public_drbg, &public));
         GUARD(s2n_drbg_instantiate(&per_thread_private_drbg, &private));
         zero_if_forked = 1;
@@ -311,7 +308,12 @@ int s2n_cpu_supports_rdrand()
     return 0;
 }
 
-/*
+/* Due to the need to support some older assemblers,
+ * we cannot use either the compiler intrinsics or
+ * the RDRAND assembly mnemonic. For this reason,
+ * we're using the opcode directly (0F C7/6). This
+ * stores the result in eax.
+ *
  * volatile is important to prevent the compiler from
  * re-ordering or optimizing the use of RDRAND.
  */
@@ -335,40 +337,23 @@ int s2n_get_rdrand_data(struct s2n_blob *out)
 
     GUARD(s2n_stuffer_init(&stuffer, out));
     while ((space_remaining = s2n_stuffer_space_remaining(&stuffer))) {
-        unsigned char success = 0;
+        int success = 0;
         output.u64 = 0;
 
         for (int tries = 0; tries < 10; tries++) {
 #if defined(__i386__)
-            /* execute the rdrand instruction, store the result in a general purpose register (it's assigned to
-            * output.i386_fields.u_low). Check the carry bit, which will be set on success. Then clober the register and reset
-            * the carry bit. Due to needing to support an ancient assembler we use the opcode syntax.
-            * the %b1 is to force compilers to use c1 instead of ecx.
-            * Here's a description of how the opcode is encoded:
-            * 0x0fc7 (rdrand)
-            * 0xf0 (store the result in eax).
-            */
-            unsigned char success_high = 0, success_low = 0;
-            __asm__ __volatile__(".byte 0x0f, 0xc7, 0xf0;\n" "setc %b1;\n": "=a"(output.i386_fields.u_low), "=qm"(success_low)
-                                 :
+            int success_high = 0, success_low = 0;
+            __asm__ __volatile__(".byte 0x48;\n" ".byte 0x0f;\n" ".byte 0xc7;\n" ".byte 0xf0;\n" "adcl $0x00, %%ebx;\n":"=b"(success_low), "=a"(output.i386_fields.u_low)
+                                 :"b"(0)
                                  :"cc");
 
-            __asm__ __volatile__(".byte 0x0f, 0xc7, 0xf0;\n" "setc %b1;\n": "=a"(output.i386_fields.u_high), "=qm"(success_high)
-                                 :
-                                 :"cc");
-
+            __asm__ __volatile__(".byte 0x48;\n" ".byte 0x0f;\n" ".byte 0xc7;\n" ".byte 0xf0;\n" "adcl $0x00, %%ebx;\n":"=b"(success_high), "=a"(output.i386_fields.u_high)
+                                :"b"(0)
+                                :"cc");
             success = success_high & success_low;
 #else
-            /* execute the rdrand instruction, store the result in a general purpose register (it's assigned to
-            * output.u64). Check the carry bit, which will be set on success. Then clober the carry bit.
-            * Due to needing to support an ancient assembler we use the opcode syntax.
-            * the %b1 is to force compilers to use c1 instead of ecx.
-            * Here's a description of how the opcode is encoded:
-            * 0x48 (pick a 64-bit register it does more too, but that's all that matters there)
-            * 0x0fc7 (rdrand)
-            * 0xf0 (store the result in rax). */
-            __asm__ __volatile__(".byte 0x48, 0x0f, 0xc7, 0xf0;\n" "setc %b1;\n": "=a"(output.u64), "=qm"(success)
-            :
+            __asm__ __volatile__(".byte 0x48;\n" ".byte 0x0f;\n" ".byte 0xc7;\n" ".byte 0xf0;\n" "adcl $0x00, %%ebx;\n":"=b"(success), "=a"(output.u64)
+            :"b"(0)
             :"cc");
 #endif /* defined(__i386__) */
 
